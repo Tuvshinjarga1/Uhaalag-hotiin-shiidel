@@ -5,6 +5,7 @@ import cv2
 import torch
 import numpy as np
 import requests
+import base64
 from datetime import datetime
 from collections import deque
 from flask import Flask, request, jsonify
@@ -29,6 +30,23 @@ VIOLENT_CLASSES = {
 }
 
 API_URL = "http://localhost:3000/api/alerts"
+
+# Сэжигтэй үйлдлийн дахин мэдэгдэх хугацааны хязгаарлалт (секундээр)
+ALERT_COOLDOWN = 10  # 10 секундын "хөргөлт"
+
+# Осол/хүчирхийллийн үргэлжлэх минимум хугацаа (секунд)
+MIN_INCIDENT_DURATION = 7  # Хамгийн багадаа 3 секунд үргэлжилсэн үйлдлийг л мэдэгдэх
+
+# Сүүлийн мэдэгдэл хадгалах
+last_alerts = {}  # {action_type: last_timestamp}
+
+# Анх илрүүлсэн үйлдлүүдийн хугацааг хадгалах
+first_detection_times = {}  # {action_key: first_time}
+
+# Нотлох баримт зураг хадгалах хавтас
+EVIDENCE_DIR = './evidence'
+if not os.path.exists(EVIDENCE_DIR):
+    os.makedirs(EVIDENCE_DIR)
 
 # Flask аппликейшн тохируулга
 app = Flask(__name__)
@@ -92,15 +110,53 @@ except Exception as e:
 
 # ----------------- [3] Сэрэмжлүүлэг илгээх -----------------
 
-def send_alert_to_server(action, confidence, location="CAM_01"):
+def encode_image_to_base64(image):
+    """
+    Зургийг base64 форматруу хөрвүүлэх
+    """
+    _, buffer = cv2.imencode('.jpg', image)
+    return base64.b64encode(buffer).decode('utf-8')
+
+def send_alert_to_server(action, confidence, location="CAM_01", evidence_images=None):
     try:
         now = datetime.now()
+        
+        # Хөргөлтийн шалгалт хийх - ижил үйлдэл ALERT_COOLDOWN секундын дотор давтагдаж байвал алгасах
+        action_key = f"{action}_{location}"
+        if action_key in last_alerts:
+            last_time = last_alerts[action_key]
+            time_diff = (now - last_time).total_seconds()
+            if time_diff < ALERT_COOLDOWN:
+                print(f"⏱️ {action} үйлдэл {time_diff:.1f} секундын өмнө илгээгдсэн тул алгаслаа")
+                return False
+        
+        # Үйлдлийн цаг хугацааг хадгалах
+        last_alerts[action_key] = now
+        
         payload = {
             "action": action,
             "confidence": confidence,
             "timestamp": now.isoformat(),
             "location": location
         }
+        
+        # Нотлох зураг байвал нэмэх
+        if evidence_images and len(evidence_images) > 0:
+            encoded_images = []
+            for i, img in enumerate(evidence_images):
+                # Зургийг base64 болгох
+                encoded_img = encode_image_to_base64(img)
+                encoded_images.append(encoded_img)
+                
+                # Зургийг файл болгон хадгалах
+                timestamp = int(time.time())
+                img_filename = f"{EVIDENCE_DIR}/{action}_{location}_{timestamp}_{i}.jpg"
+                cv2.imwrite(img_filename, img)
+                print(f"✅ Нотлох зураг хадгалагдлаа: {img_filename}")
+            
+            # Нотлох зургийг payload-д нэмэх
+            payload["evidence_images"] = encoded_images
+        
         response = requests.post(API_URL, json=payload, timeout=5)
         if response.status_code == 200:
             print(f"✅ Сэрэмжлүүлэг амжилттай илгээгдлээ: {action}")
@@ -134,6 +190,15 @@ def process_video(video_path, location_id="CAM_01"):
     alerts = []
     frame_buffer = deque(maxlen=16)
     
+    # Тухайн видео файлын хүрээнд мэдэгдсэн үйлдлүүдийн сүүлийн цаг
+    local_alert_times = {}
+    
+    # Зургийн нотолгоотой холбоотой хувьсагчууд
+    capture_evidence = {}  # {action_key: [next_capture_frame, [existing_frames]]}
+    
+    # Үйлдлүүдийн эхний илрүүлэлтийн хугацаа
+    local_first_detections = {}  # {action_key: first_time}
+    
     try:
         while True:
             ret, frame = cap.read()
@@ -141,7 +206,49 @@ def process_video(video_path, location_id="CAM_01"):
                 break
                 
             frame_count += 1
-            if frame_count % 5 != 0:  # 5 кадр тутамд боловсруулах
+            current_time = time.time()
+            
+            # Нотлох зураг авах шаардлагатай эсэхийг шалгах
+            for action_key, (next_frame, frames) in list(capture_evidence.items()):
+                if frame_count == next_frame:
+                    # Хоёрдахь зургийг нэмэх
+                    frames.append(frame.copy())
+                    if len(frames) == 2:
+                        # Аль нэг үйлдэлд 2 зураг цугларсан бол мэдэгдэл явуулах
+                        action, location = action_key.split('_', 1)
+                        alert_info = next((a for a in alerts if a["action"] == action), None)
+                        
+                        # Илрүүлэлтийн нийт үргэлжилсэн хугацааг тооцоолох
+                        first_detected_time = local_first_detections.get(action_key, 0)
+                        detection_duration = current_time - first_detected_time
+                        
+                        # Хэрэв хангалттай удаан (9+ секунд) үргэлжилсэн бол мэдэгдэл явуулах
+                        if detection_duration >= MIN_INCIDENT_DURATION and alert_info:
+                            print(f"✅ {action} үйлдэл {detection_duration:.1f} секунд үргэлжилсэн, мэдэгдэл явуулж байна")
+                            
+                            # Нотлох дүрсэн дээр үргэлжилсэн хугацааг нэмж харуулах
+                            cv2.putText(frames[1], f"{detection_duration:.1f} секунд үргэлжилсэн", (10, 60), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                            
+                            send_alert_to_server(
+                                action, 
+                                alert_info["confidence"], 
+                                location, 
+                                frames
+                            )
+                        else:
+                            print(f"⏱️ {action} үйлдэл {detection_duration:.1f} секунд үргэлжилсэн - хангалттай удаан биш ({MIN_INCIDENT_DURATION} сек шаардлагатай)")
+                            
+                        # Хураангуй жагсаалтаас цэвэрлэх
+                        del capture_evidence[action_key]
+                    else:
+                        # Дараагийн зургийг 5 секундын дараа авах
+                        fps = cap.get(cv2.CAP_PROP_FPS)
+                        next_frame = frame_count + int(fps * 5)  # 5 секундын дараа
+                        capture_evidence[action_key] = (next_frame, frames)
+            
+            # 5 кадр тутамд боловсруулах
+            if frame_count % 5 != 0:
                 continue
                 
             results = yolo_model.predict(frame)
@@ -173,15 +280,46 @@ def process_video(video_path, location_id="CAM_01"):
                                 action = KINETICS_CLASSES.get(str(pred_id), "Unknown")
                                 
                                 if action in VIOLENT_CLASSES and conf > 0.10:
-                                    alert = {
-                                        "frame": frame_count,
-                                        "type": "violent_action",
-                                        "action": action,
-                                        "confidence": float(conf),
-                                        "bbox": [int(x1), int(y1), int(x2), int(y2)]
-                                    }
-                                    alerts.append(alert)
-                                    send_alert_to_server(action, conf, location_id)
+                                    # Хөргөлтийн шалгалт хийх - дотоод
+                                    now = time.time()
+                                    action_key = f"{action}_{location_id}"
+                                    can_alert = True
+                                    
+                                    if action_key in local_alert_times:
+                                        time_diff = now - local_alert_times[action_key]
+                                        if time_diff < ALERT_COOLDOWN:
+                                            can_alert = False
+                                            print(f"⏱️ {action} үйлдэл видео доторх {time_diff:.1f} секундын дотор илрүүлсэн тул алгаслаа")
+                                    
+                                    if can_alert:
+                                        local_alert_times[action_key] = now
+                                        
+                                        # Эхний илрүүлэлтийн хугацааг хадгалах
+                                        if action_key not in local_first_detections:
+                                            local_first_detections[action_key] = now
+                                            print(f"⏱️ {action} үйлдэл эхлэлийн хугацааг бүртгэлээ: {now}")
+                                        
+                                        alert = {
+                                            "frame": frame_count,
+                                            "type": "violent_action",
+                                            "action": action,
+                                            "confidence": float(conf),
+                                            "bbox": [int(x1), int(y1), int(x2), int(y2)]
+                                        }
+                                        alerts.append(alert)
+                                        
+                                        # Нотлох зургийг авах - эхний зураг
+                                        evidence_frame = frame.copy()
+                                        # Боксыг зурах
+                                        cv2.rectangle(evidence_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                                        label_text = f"{action} ({conf:.2f})"
+                                        cv2.putText(evidence_frame, label_text, (x1, y1-10), 
+                                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                                        
+                                        # Дараагийн зураг авах хугацааг тооцоолох
+                                        fps = cap.get(cv2.CAP_PROP_FPS)
+                                        next_frame = frame_count + int(fps * 5)  # 5 секундын дараа
+                                        capture_evidence[action_key] = (next_frame, [evidence_frame])
                     
                     # Машины осол шалгах
                     elif label == "car" and x2-x1 > 80:  # Хэт жижиг машинуудыг алгасах
@@ -206,15 +344,46 @@ def process_video(video_path, location_id="CAM_01"):
                                     score_value = float(score)
                                     
                                     if label_text == "accident":
-                                        alert = {
-                                            "frame": frame_count,
-                                            "type": "traffic_accident",
-                                            "action": label_text,
-                                            "confidence": score_value,
-                                            "bbox": [int(x1), int(y1), int(x2), int(y2)]
-                                        }
-                                        alerts.append(alert)
-                                        send_alert_to_server(label_text, score_value, location_id)
+                                        # Хөргөлтийн шалгалт хийх - дотоод
+                                        now = time.time()
+                                        action_key = f"{label_text}_{location_id}"
+                                        can_alert = True
+                                        
+                                        if action_key in local_alert_times:
+                                            time_diff = now - local_alert_times[action_key]
+                                            if time_diff < ALERT_COOLDOWN:
+                                                can_alert = False
+                                                print(f"⏱️ {label_text} үйлдэл видео доторх {time_diff:.1f} секундын дотор илрүүлсэн тул алгаслаа")
+                                        
+                                        if can_alert:
+                                            local_alert_times[action_key] = now
+                                            
+                                            # Эхний илрүүлэлтийн хугацааг хадгалах
+                                            if action_key not in local_first_detections:
+                                                local_first_detections[action_key] = now
+                                                print(f"⏱️ {label_text} үйлдэл эхлэлийн хугацааг бүртгэлээ: {now}")
+                                            
+                                            alert = {
+                                                "frame": frame_count,
+                                                "type": "traffic_accident",
+                                                "action": label_text,
+                                                "confidence": score_value,
+                                                "bbox": [int(x1), int(y1), int(x2), int(y2)]
+                                            }
+                                            alerts.append(alert)
+                                            
+                                            # Нотлох зургийг авах - эхний зураг
+                                            evidence_frame = frame.copy()
+                                            # Боксыг зурах
+                                            cv2.rectangle(evidence_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                                            info_text = f"{label_text} ({score_value:.2f})"
+                                            cv2.putText(evidence_frame, info_text, (x1, y1-10), 
+                                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                                            
+                                            # Дараагийн зураг авах хугацааг тооцоолох
+                                            fps = cap.get(cv2.CAP_PROP_FPS)
+                                            next_frame = frame_count + int(fps * 5)  # 5 секундын дараа
+                                            capture_evidence[action_key] = (next_frame, [evidence_frame])
                                         
                             except Exception as e:
                                 print(f"❌ DETR осол шалгах алдаа: {str(e)}")
@@ -224,6 +393,10 @@ def process_video(video_path, location_id="CAM_01"):
         return {"error": f"Видео боловсруулахад алдаа гарлаа: {str(e)}"}
     
     cap.release()
+    
+    # Шаардлагатай нотлох зураг авч чадаагүй үйлдлүүдийг хүлээж байсан бол API рүү мэдэгдэл явуулахгүйгээр дуусгах
+    for action_key, (_, frames) in capture_evidence.items():
+        print(f"⚠️ {action_key} үйлдэлд бүрэн нотлох зураг авч чадаагүй")
     
     return {
         "success": True,
